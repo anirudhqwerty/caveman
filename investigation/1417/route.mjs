@@ -28,9 +28,10 @@ function environment(home) {
   return env;
 }
 
-function run(command, args, env, cwd) {
+function run(command, args, env, cwd, input = null) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { env, cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { env, cwd, windowsHide: true, stdio: [input === null ? 'ignore' : 'pipe', 'pipe', 'pipe'] });
+    if (input !== null) child.stdin.end(input);
     let stdout = '', stderr = '';
     child.stdout.on('data', chunk => stdout += chunk);
     child.stderr.on('data', chunk => stderr += chunk);
@@ -66,10 +67,8 @@ for (let number = 1; number <= 2; number++) {
   mkdirSync(workspace);
   const key = `sk-dummy-local-route-${number}`;
   env.OPENAI_API_KEY = key;
-  const config = 'model = "gpt-5.5"\nmodel_reasoning_effort = "low"\n[analytics]\nenabled = false\n';
-  const auth = JSON.stringify({ auth_mode: 'api_key', OPENAI_API_KEY: key });
+  const config = 'model = "gpt-5.5"\nmodel_reasoning_effort = "low"\ncli_auth_credentials_store = "file"\n[analytics]\nenabled = false\n';
   writeFileSync(join(env.CODEX_HOME, 'config.toml'), config);
-  writeFileSync(join(env.CODEX_HOME, 'auth.json'), auth);
   mkdirSync(join(home, '.caveman-cloud'));
   writeFileSync(join(home, '.caveman-cloud', 'config.json'), JSON.stringify({ wrap: { proxy: false, shrink: false, mcp: false, browse: false, delegate: false } }));
   const binary = resolveWindowsCommand('codex', env);
@@ -78,6 +77,13 @@ for (let number = 1; number <= 2; number++) {
   const version = await run(versionInvocation.command, versionInvocation.args, env, workspace);
   assert.equal(version.code, 0, version.stderr);
   assert.match(version.stdout, /0\.165\.0/);
+  // Have the real binary create its own credential schema, with a dummy key
+  // and file storage inside this scratch home (never the Windows keychain).
+  const loginInvocation = portableInvocation(binary, ['login', '--with-api-key'], { env });
+  const login = await run(loginInvocation.command, loginInvocation.args, env, workspace, `${key}\n`);
+  assert.equal(login.code, 0, login.stderr);
+  const auth = readFileSync(join(env.CODEX_HOME, 'auth.json'), 'utf8');
+  assert.equal(JSON.parse(auth).OPENAI_API_KEY, key);
   const requests = [];
   const marker = `CAVE_ROUTE_OK_${number}`;
   const server = createServer(async (request, response) => {
@@ -96,9 +102,9 @@ for (let number = 1; number <= 2; number++) {
   let output;
   try { output = await run(process.execPath, args, env, workspace); }
   finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
-  const result = { number, platform: process.platform, node: process.version, home, port, version, argv: args.slice(1), modelSource: 'scratch config.toml; no CLI model override', output, requests };
+  const result = { number, platform: process.platform, node: process.version, home, port, version, authMode: JSON.parse(auth).auth_mode, login, argv: args.slice(1), modelSource: 'scratch config.toml; no CLI model override', output, requests };
   writeFileSync(join(evidence, `route-${number}.json`), JSON.stringify(result, null, 2));
-  console.log(JSON.stringify(result));
+  console.log(JSON.stringify({ ...result, requests: requests.map(request => ({ ...request, body: request.body ? { model: request.body.model, stream: request.body.stream } : null })) }));
   assert.equal(output.code, 0, output.stderr);
   assert.ok(output.stdout.includes(marker), 'Codex must consume the complete scripted SSE reply');
   const modelRequests = requests.filter(request => request.method === 'POST');
